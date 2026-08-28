@@ -1,112 +1,222 @@
-"""天气查询 + 旅游地点推荐
-
-流程：requests 查天气 -> tavily 搜索旅游资料 -> DeepSeek(openai 兼容) 生成建议
-密钥从 .env 读取（已被 git 忽略，勿硬编码到代码里）。
-"""
-
+import re
 import os
 import sys
-
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
 from tavily import TavilyClient
+from openai import OpenAI
 
+# 加载 .env 中的密钥（已被 git 忽略，勿硬编码到代码里）
 load_dotenv()
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+# ===================== 1. 智能体系统指令模板 =====================
+AGENT_SYSTEM_PROMPT = """
+你是一个智能旅行助手。你的任务是分析用户的请求，并使用可用工具一步步地解决问题。
+
+# 可用工具:
+- `get_weather(city: str)`: 查询指定城市的实时天气。
+- `get_attraction(city: str, weather: str)`: 根据城市和天气搜索推荐的旅游景点。
+
+# 输出格式要求:
+你的每次回复必须严格遵循以下格式，包含一对Thought和Action：
+Thought: [你的思考过程和下一步计划]
+Action: [你要执行的具体行动]
+
+Action的格式必须是以下之一：
+1. 调用工具：function_name(arg_name="arg_value")
+2. 结束任务：Finish[最终答案]
+
+# 重要提示:
+- 每次只输出一对Thought-Action
+- Action必须在同一行，不要换行
+- 当收集到足够信息可以回答用户问题时，必须使用 Action: Finish[最终答案] 格式结束
+
+请开始吧！
+"""
+
+# ===================== 2. 工具函数 =====================
+
+def get_weather(city: str) -> str:
+    """
+    通过调用 wttr.in API 查询真实的天气信息。
+    """
+    url = f"https://wttr.in/{city}?format=j1"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+
+        current_condition = data['current_condition'][0]
+        weather_desc = current_condition['weatherDesc'][0]['value']
+        temp_c = current_condition['temp_C']
+
+        return f"{city}当前天气:{weather_desc}，气温{temp_c}摄氏度"
+
+    except requests.exceptions.RequestException as e:
+        return f"错误:查询天气时遇到网络问题 - {e}"
+    except (KeyError, IndexError) as e:
+        return f"错误:解析天气数据失败，可能是城市名称无效 - {e}"
 
 
-def check_keys():
-    if not DEEPSEEK_API_KEY:
-        print("[错误] 未配置 DEEPSEEK_API_KEY，请在 .env 中填入")
-        sys.exit(1)
-    if not TAVILY_API_KEY:
-        print("[错误] 未配置 TAVILY_API_KEY，请在 .env 中填入")
-        sys.exit(1)
+def get_attraction(city: str, weather: str) -> str:
+    """
+    根据城市和天气，使用Tavily Search API搜索并返回优化后的景点推荐。
+    """
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        return "错误:未配置TAVILY_API_KEY环境变量。"
+
+    tavily = TavilyClient(api_key=api_key)
+    query = f"'{city}' 在'{weather}'天气下最值得去的旅游景点推荐及理由"
+
+    try:
+        response = tavily.search(
+            query=query,
+            search_depth="basic",
+            include_answer=True
+        )
+
+        if response.get("answer"):
+            return response["answer"]
+
+        formatted_results = []
+        for result in response.get("results", []):
+            formatted_results.append(f"- {result['title']}: {result['content']}")
+
+        if not formatted_results:
+            return "抱歉，没有找到相关的旅游景点推荐。"
+
+        return "根据搜索，为您找到以下信息:\n" + "\n".join(formatted_results)
+
+    except Exception as e:
+        return f"错误:执行Tavily搜索时出现问题 - {e}"
 
 
-def get_weather(city):
-    """Open-Meteo 免费接口，无需 key：城市名 -> 经纬度 -> 当前天气"""
-    geo = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": city, "count": 1, "language": "zh"},
-        timeout=10,
-    ).json()
-    if not geo.get("results"):
-        return f"未找到城市「{city}」"
-    loc = geo["results"][0]
-    wx = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": loc["latitude"],
-            "longitude": loc["longitude"],
-            "current_weather": True,
-            "timezone": "auto",
-        },
-        timeout=10,
-    ).json()["current_weather"]
-    name = loc.get("name", city)
-    return (
-        f"{name}：温度 {wx['temperature']}°C，"
-        f"天气代码 {wx['weathercode']}，风速 {wx['windspeed']} km/h"
-    )
+# 工具注册字典：名字 -> 函数对象
+available_tools = {
+    "get_weather": get_weather,
+    "get_attraction": get_attraction,
+}
 
+# ===================== 3. 通用大模型客户端 =====================
 
-def search_travel(city):
-    """用 Tavily 搜索该城市的旅游景点资料"""
-    resp = TavilyClient(api_key=TAVILY_API_KEY).search(
-        query=f"{city} 旅游景点推荐 必去",
-        search_depth="basic",
-        max_results=5,
-    )
-    results = resp.get("results", []) if isinstance(resp, dict) else getattr(resp, "results", [])
-    return "\n".join(f"- {r.get('title', '')}: {r.get('content', '')[:100]}" for r in results)
+class OpenAICompatibleClient:
+    """
+    一个用于调用任何兼容OpenAI接口的LLM服务的客户端。
+    """
+    def __init__(self, model: str, api_key: str, base_url: str):
+        self.model = model
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
 
+    def generate(self, prompt: str, system_prompt: str) -> str:
+        """调用LLM API来生成回应。"""
+        print("正在调用大语言模型...")
+        try:
+            messages = [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': prompt}
+            ]
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=False
+            )
+            answer = response.choices[0].message.content
+            print("大语言模型响应成功。")
+            return answer
+        except Exception as e:
+            print(f"调用LLM API时发生错误: {e}")
+            return "错误:调用语言模型服务时出错。"
 
-def recommend(city, weather_text, travel_info):
-    """让 DeepSeek 结合天气和搜索资料给出旅游建议"""
-    prompt = f"""你是资深旅游规划师。用户想了解「{city}」的天气并得到旅游推荐。
-
-当前天气：{weather_text}
-
-网上搜索到的景点资料：
-{travel_info or "（无）"}
-
-请结合天气给出：1) 是否适合旅游；2) 推荐 3-5 个地点及理由；3) 出行建议（穿衣、时间）。用中文回答，简洁实用。"""
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-    reply = client.chat.completions.create(
-        model=DEEPSEEK_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-    )
-    return reply.choices[0].message.content
-
-
-def main():
-    if hasattr(sys.stdout, "reconfigure"):  # Windows 控制台中文乱码修复
-        sys.stdout.reconfigure(encoding="utf-8")
-    check_keys()
-    city = input("请输入城市名（如：杭州）：").strip()
-    if not city:
-        print("城市名不能为空")
-        return
-
-    print(f"\n[1/3] 查询「{city}」天气...")
-    weather_text = get_weather(city)
-    print("天气：", weather_text)
-
-    print("\n[2/3] 搜索旅游资料...")
-    travel_info = search_travel(city)
-    print(travel_info or "（Tavily 未返回结果）")
-
-    print("\n[3/3] DeepSeek 生成旅游建议...")
-    print("\n===== 旅游建议 =====\n")
-    print(recommend(city, weather_text, travel_info))
-
+# ===================== 4. 主循环：智能体执行入口 =====================
 
 if __name__ == "__main__":
-    main()
+    # Windows 控制台中文乱码修复
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    # ---------- 配置区：从 .env 读取密钥，勿直接硬编码 ----------
+    API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+    BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    MODEL_ID = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+
+    if not API_KEY or not TAVILY_API_KEY:
+        print("[错误] 请在 .env 中配置 DEEPSEEK_API_KEY 和 TAVILY_API_KEY")
+        sys.exit(1)
+
+    # 设置环境变量，供 get_attraction 读取
+    os.environ['TAVILY_API_KEY'] = TAVILY_API_KEY
+
+    # 初始化大模型客户端
+    llm = OpenAICompatibleClient(
+        model=MODEL_ID,
+        api_key=API_KEY,
+        base_url=BASE_URL
+    )
+
+    # ---------- 初始化对话 ----------
+    user_prompt = "你好，请帮我查询一下今天北京的天气，然后根据天气推荐一个合适的旅游景点。"
+    prompt_history = [f"用户请求: {user_prompt}"]
+    print(f"用户输入: {user_prompt}\n" + "=" * 40)
+
+    # ---------- 运行主循环（最多5步） ----------
+    for i in range(5):
+        print(f"\n--- 循环 {i+1} ---")
+
+        # 3.1 拼接完整对话历史
+        full_prompt = "\n".join(prompt_history)
+
+        # 3.2 调用大模型生成思考与行动
+        llm_output = llm.generate(full_prompt, system_prompt=AGENT_SYSTEM_PROMPT)
+
+        # 截断多余的 Thought-Action，保证每轮只执行一步
+        match = re.search(
+            r'(Thought:.*?Action:.*?)(?=\n\s*(?:Thought:|Action:|Observation:)|\Z)',
+            llm_output,
+            re.DOTALL
+        )
+        if match:
+            truncated = match.group(1).strip()
+            if truncated != llm_output.strip():
+                llm_output = truncated
+                print("已截断多余的 Thought-Action 对")
+
+        print(f"模型输出:\n{llm_output}\n")
+        prompt_history.append(llm_output)
+
+        # 3.3 解析 Action
+        action_match = re.search(r"Action: (.*)", llm_output, re.DOTALL)
+        if not action_match:
+            observation = "错误: 未能解析到 Action 字段。请确保你的回复严格遵循 'Thought: ... Action: ...' 的格式。"
+            observation_str = f"Observation: {observation}"
+            print(f"{observation_str}\n" + "=" * 40)
+            prompt_history.append(observation_str)
+            continue
+
+        action_str = action_match.group(1).strip()
+
+        # 判断是否结束任务
+        if action_str.startswith("Finish"):
+            final_answer = re.match(r"Finish\[(.*)\]", action_str).group(1)
+            print("\n" + "=" * 40)
+            print(f"任务完成，最终答案:\n{final_answer}")
+            break
+
+        # 解析工具名和参数
+        tool_name = re.search(r"(\w+)\(", action_str).group(1)
+        args_str = re.search(r"\((.*)\)", action_str).group(1)
+        kwargs = dict(re.findall(r'(\w+)="([^"]*)"', args_str))
+
+        # 调用工具
+        if tool_name in available_tools:
+            observation = available_tools[tool_name](**kwargs)
+        else:
+            observation = f"错误:未定义的工具 '{tool_name}'"
+
+        # 3.4 记录工具返回结果
+        observation_str = f"Observation: {observation}"
+        print(f"{observation_str}\n" + "=" * 40)
+        prompt_history.append(observation_str)
+    else:
+        print("\n已达到最大循环次数，任务未完成。")
