@@ -103,9 +103,19 @@ available_tools = {
 class OpenAICompatibleClient:
     """
     一个用于调用任何兼容OpenAI接口的LLM服务的客户端。
+    已适配 DeepSeek：可调节推理强度 reasoning_effort 与思考模式 thinking。
     """
-    def __init__(self, model: str, api_key: str, base_url: str):
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str,
+        reasoning_effort: str = "high",
+        thinking: bool = True,
+    ):
         self.model = model
+        self.reasoning_effort = reasoning_effort  # 推理强度: low / medium / high
+        self.thinking = thinking
         self.client = OpenAI(api_key=api_key, base_url=base_url)
 
     def generate(self, prompt: str, system_prompt: str) -> str:
@@ -116,10 +126,13 @@ class OpenAICompatibleClient:
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': prompt}
             ]
+            extra_body = {"thinking": {"type": "enabled" if self.thinking else "disabled"}}
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                stream=False
+                stream=False,
+                reasoning_effort=self.reasoning_effort,
+                extra_body=extra_body,
             )
             answer = response.choices[0].message.content
             print("大语言模型响应成功。")
@@ -138,7 +151,9 @@ if __name__ == "__main__":
     # ---------- 配置区：从 .env 读取密钥，勿直接硬编码 ----------
     API_KEY = os.environ.get("DEEPSEEK_API_KEY")
     BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    MODEL_ID = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+    MODEL_ID = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")  # 默认锁定 flash
+    REASONING_EFFORT = os.environ.get("DEEPSEEK_REASONING_EFFORT", "high")  # low/medium/high
+    THINKING = os.environ.get("DEEPSEEK_THINKING", "true").lower() in ("1", "true", "yes")
     TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
 
     if not API_KEY or not TAVILY_API_KEY:
@@ -152,11 +167,18 @@ if __name__ == "__main__":
     llm = OpenAICompatibleClient(
         model=MODEL_ID,
         api_key=API_KEY,
-        base_url=BASE_URL
+        base_url=BASE_URL,
+        reasoning_effort=REASONING_EFFORT,
+        thinking=THINKING,
     )
+    print(f"模型: {MODEL_ID} | 推理强度: {REASONING_EFFORT} | 思考模式: {'开' if THINKING else '关'}")
 
     # ---------- 初始化对话 ----------
-    user_prompt = "你好，请帮我查询一下今天北京的天气，然后根据天气推荐一个合适的旅游景点。"
+    city = input("请输入要查询天气的城市名（如：杭州）：").strip()
+    if not city:
+        print("城市名不能为空")
+        sys.exit(1)
+    user_prompt = f"你好，请帮我查询一下今天{city}的天气，然后根据天气推荐一个合适的旅游景点。"
     prompt_history = [f"用户请求: {user_prompt}"]
     print(f"用户输入: {user_prompt}\n" + "=" * 40)
 
